@@ -121,6 +121,25 @@ pub fn sys_prctl(
             ctx.user_space()
                 .write_val(write_addr, &(process.is_child_subreaper() as u32))?;
         }
+        PrctlCmd::PR_GET_SECCOMP => {
+            return Ok(SyscallReturn::Return(
+                ctx.posix_thread.seccomp_mode() as isize
+            ));
+        }
+        PrctlCmd::PR_SET_SECCOMP(mode, uargs) => {
+            let ret = match mode {
+                1 => super::seccomp::sys_seccomp(0, 0, 0, ctx)?,
+                2 => super::seccomp::sys_seccomp(1, 0, uargs, ctx)?,
+                _ => return_errno_with_message!(Errno::EINVAL, "invalid seccomp mode for prctl"),
+            };
+            return Ok(ret);
+        }
+        PrctlCmd::PR_SET_NO_NEW_PRIVS => ctx.posix_thread.set_no_new_privs(),
+        PrctlCmd::PR_GET_NO_NEW_PRIVS => {
+            return Ok(SyscallReturn::Return(
+                ctx.posix_thread.no_new_privs() as isize
+            ));
+        }
     }
 
     Ok(SyscallReturn::Return(0))
@@ -134,6 +153,8 @@ const PR_GET_KEEPCAPS: i32 = 7;
 const PR_SET_KEEPCAPS: i32 = 8;
 const PR_SET_NAME: i32 = 15;
 const PR_GET_NAME: i32 = 16;
+const PR_GET_SECCOMP: i32 = 21;
+const PR_SET_SECCOMP: i32 = 22;
 const PR_CAPBSET_READ: i32 = 23;
 const PR_CAPBSET_DROP: i32 = 24;
 const PR_GET_SECUREBITS: i32 = 27;
@@ -142,6 +163,8 @@ const PR_SET_TIMERSLACK: i32 = 29;
 const PR_GET_TIMERSLACK: i32 = 30;
 const PR_SET_CHILD_SUBREAPER: i32 = 36;
 const PR_GET_CHILD_SUBREAPER: i32 = 37;
+const PR_SET_NO_NEW_PRIVS: i32 = 38;
+const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
 #[expect(non_camel_case_types)]
 #[derive(Clone, Copy, Debug)]
@@ -154,6 +177,8 @@ pub enum PrctlCmd {
     PR_SET_KEEPCAPS(u32),
     PR_SET_NAME(Vaddr),
     PR_GET_NAME(Vaddr),
+    PR_GET_SECCOMP,
+    PR_SET_SECCOMP(u64, Vaddr),
     PR_CAPBSET_READ(CapSet),
     PR_CAPBSET_DROP(CapSet),
     PR_GET_SECUREBITS,
@@ -162,6 +187,8 @@ pub enum PrctlCmd {
     PR_GET_TIMERSLACK,
     PR_SET_CHILD_SUBREAPER(bool),
     PR_GET_CHILD_SUBREAPER(Vaddr),
+    PR_SET_NO_NEW_PRIVS,
+    PR_GET_NO_NEW_PRIVS,
 }
 
 #[repr(u64)]
@@ -173,7 +200,7 @@ pub enum Dumpable {
 }
 
 impl PrctlCmd {
-    fn from_args(option: i32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> Result<PrctlCmd> {
+    fn from_args(option: i32, arg2: u64, arg3: u64, _arg4: u64, _arg5: u64) -> Result<PrctlCmd> {
         match option {
             PR_SET_PDEATHSIG => {
                 let signum = SigNum::try_from(arg2 as u8)?;
@@ -186,6 +213,8 @@ impl PrctlCmd {
             PR_SET_KEEPCAPS => Ok(PrctlCmd::PR_SET_KEEPCAPS(arg2 as _)),
             PR_SET_NAME => Ok(PrctlCmd::PR_SET_NAME(arg2 as _)),
             PR_GET_NAME => Ok(PrctlCmd::PR_GET_NAME(arg2 as _)),
+            PR_GET_SECCOMP => Ok(PrctlCmd::PR_GET_SECCOMP),
+            PR_SET_SECCOMP => Ok(PrctlCmd::PR_SET_SECCOMP(arg2, arg3 as _)),
             PR_CAPBSET_READ => Ok(PrctlCmd::PR_CAPBSET_READ(parse_capability(arg2)?)),
             PR_CAPBSET_DROP => Ok(PrctlCmd::PR_CAPBSET_DROP(parse_capability(arg2)?)),
             PR_GET_SECUREBITS => Ok(PrctlCmd::PR_GET_SECUREBITS),
@@ -196,6 +225,14 @@ impl PrctlCmd {
             PR_GET_TIMERSLACK => Ok(PrctlCmd::PR_GET_TIMERSLACK),
             PR_SET_CHILD_SUBREAPER => Ok(PrctlCmd::PR_SET_CHILD_SUBREAPER(arg2 > 0)),
             PR_GET_CHILD_SUBREAPER => Ok(PrctlCmd::PR_GET_CHILD_SUBREAPER(arg2 as _)),
+            PR_SET_NO_NEW_PRIVS => {
+                if arg2 != 1 || arg3 != 0 || _arg4 != 0 || _arg5 != 0 {
+                    return_errno!(Errno::EINVAL)
+                } else {
+                    Ok(PrctlCmd::PR_SET_NO_NEW_PRIVS)
+                }
+            }
+            PR_GET_NO_NEW_PRIVS => Ok(PrctlCmd::PR_GET_NO_NEW_PRIVS),
             _ => {
                 debug!("prctl cmd number: {}", option);
                 return_errno_with_message!(Errno::EINVAL, "unsupported prctl command");

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use aster_rights::{ReadDupOp, ReadOp, ReadWriteOp};
+use cbpf::{SeccompFilterLeaf, SeccompMode, SeccompState};
 use ostd::{
-    sync::{RoArc, RwMutexReadGuard, Waker},
+    sync::{Rcu, RoArc, RwMutexReadGuard, Waker},
     task::Task,
 };
 use spin::Once;
@@ -20,7 +21,7 @@ use crate::{
     process::{
         ExitCode, Pid,
         namespace::nsproxy::NsProxy,
-        posix_thread::ptrace::TraceeStatus,
+        posix_thread::{cbpf::SeccompFilterProg, ptrace::TraceeStatus},
         signal::{PauseReason, PollHandle, sig_mask::SigMask},
     },
     thread::{Thread, Tid},
@@ -29,6 +30,7 @@ use crate::{
 
 pub mod alien_access;
 mod builder;
+pub mod cbpf;
 mod cpu_sync;
 mod exit;
 pub mod futex;
@@ -107,6 +109,12 @@ pub struct PosixThread {
 
     /// The personality value for this thread.
     personality: AtomicU32,
+
+    /// The seccomp policy state of this thread. Always present; starts as [`SeccompMode::Disabled`].
+    seccomp: Rcu<Arc<SeccompState>>,
+
+    /// Whether the thread is allowed to create new privilege (via execve etc.)
+    no_new_privs: AtomicBool,
 }
 
 impl PosixThread {
@@ -342,6 +350,115 @@ impl PosixThread {
     /// Returns the exit code of this thread.
     pub fn exit_code(&self) -> ExitCode {
         self.exit_code.load(Ordering::Relaxed)
+    }
+
+    /// Returns the current seccomp mode of this thread.
+    ///
+    /// Reads through the RCU cell and returns the mode by copy without
+    /// cloning any [`Arc`]. Preemption is disabled only for the brief
+    /// pointer load. Use this on the syscall hot path where only the mode
+    /// is needed.
+    pub fn seccomp_mode(&self) -> SeccompMode {
+        self.seccomp.read().get().mode
+    }
+
+    /// Returns the top cBPF seccomp filter leaf of this thread, if installed.
+    ///
+    /// Clones the [`Arc`] out of the RCU cell and releases the read guard
+    /// immediately, so preemption is re-enabled before this function returns.
+    /// The caller can then walk the full filter chain via
+    /// [`SeccompFilterLeaf::prev`] without holding any lock or disabling preemption.
+    ///
+    /// Not used at this point, might be removed in future.
+    #[expect(dead_code)]
+    pub fn seccomp_filter(&self) -> Option<Arc<SeccompFilterLeaf>> {
+        self.seccomp.read().get().leaf_filter.clone()
+    }
+
+    /// Returns a cloned reference to the entire seccomp state.
+    ///
+    /// Used when inheriting the seccomp state across thread creation or fork.
+    pub fn seccomp_state(&self) -> Arc<SeccompState> {
+        self.seccomp.read().get().clone()
+    }
+
+    /// Sets the seccomp mode to [`Strict`] for this thread.
+    ///
+    /// Seccomp mode can be changed only if it is [`Disabled`].
+    pub fn set_seccomp_strict(&self) -> Result<i64> {
+        loop {
+            let guard = self.seccomp.read();
+            let current_state = guard.get();
+
+            // should we guard against internel kernel logic bugs?
+            if current_state.mode != SeccompMode::Disabled {
+                return_errno!(Errno::EINVAL);
+            }
+            // debug_assert!(
+            //     current_state.mode == SeccompMode::Disabled,
+            //     "Should be reacheble only if seccomp is disabled"
+            // );
+
+            match guard.compare_exchange(Arc::new(SeccompState {
+                mode: SeccompMode::Strict,
+                leaf_filter: None,
+            })) {
+                Ok(()) => return Ok(0),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Pushes a new leaf BPF filter program onto this thread's seccomp filter chain and sets the mode to [`Filter`].
+    pub fn set_n_push_seccomp_filter(&self, filter: SeccompFilterProg) -> Arc<SeccompState> {
+        loop {
+            let guard = self.seccomp.read();
+            let current_state = guard.get();
+
+            // should we guard against internel kernel logic bugs?
+            // if current_state.mode == SeccompMode::Strict {
+            //     return Err::new(Errno::EACCES);
+            // }
+            debug_assert!(
+                current_state.mode != SeccompMode::Strict,
+                "Should be unreachable from Strict, as it disables seccomp syscall"
+            );
+
+            let new_leaf = Arc::new(SeccompFilterLeaf {
+                ins: filter.clone(),
+                prev: current_state.leaf_filter.clone(),
+            });
+            let new_state = Arc::new(SeccompState {
+                mode: SeccompMode::Filter,
+                leaf_filter: Some(new_leaf),
+            });
+
+            match guard.compare_exchange(new_state.clone()) {
+                Ok(()) => return new_state,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Sets the seccomp state for this thread.
+    ///
+    /// Used when syncronizing seccomp state between threads, e.g. with [`SeccompFilterFlags::TSYNC`].
+    pub fn set_seccomp_state(&self, state: Arc<SeccompState>) {
+        loop {
+            let guard = self.seccomp.read();
+            match guard.compare_exchange(state.clone()) {
+                Ok(()) => return,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub fn no_new_privs(&self) -> bool {
+        self.no_new_privs.load(Ordering::Relaxed)
+    }
+
+    pub fn set_no_new_privs(&self) {
+        self.no_new_privs.store(true, Ordering::Relaxed)
     }
 }
 

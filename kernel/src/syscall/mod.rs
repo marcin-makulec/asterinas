@@ -11,7 +11,23 @@ pub use clock_gettime::ClockId;
 use ostd::arch::cpu::context::UserContext;
 pub use timer_create::create_timer;
 
-use crate::{cpu::LinuxAbi, prelude::*};
+use crate::{
+    cpu::LinuxAbi,
+    prelude::*,
+    process::{
+        TermStatus,
+        posix_thread::{cbpf::SeccompMode, do_exit, do_exit_group},
+        signal::{
+            c_types::siginfo_t,
+            constants::{SIGKILL, SIGSYS},
+            signals::raw::RawSignal,
+        },
+    },
+    syscall::{
+        arch::{SYS_EXIT, SYS_READ, SYS_RT_SIGRETURN, SYS_WRITE},
+        seccomp::SeccompFilterAction,
+    },
+};
 
 #[cfg_attr(target_arch = "x86_64", path = "arch/x86.rs")]
 #[cfg_attr(target_arch = "riscv64", path = "arch/riscv.rs")]
@@ -134,6 +150,7 @@ mod sched_setattr;
 mod sched_setparam;
 mod sched_setscheduler;
 mod sched_yield;
+mod seccomp;
 mod select;
 mod semctl;
 mod semget;
@@ -372,7 +389,70 @@ impl SyscallArgument {
 }
 
 pub fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
-    let syscall_frame = SyscallArgument::new_from_context(user_ctx);
+    let syscall_frame = &SyscallArgument::new_from_context(user_ctx);
+
+    match ctx.posix_thread.seccomp_mode() {
+        SeccompMode::Disabled => (),
+        SeccompMode::Strict => {
+            if ![SYS_READ, SYS_WRITE, SYS_RT_SIGRETURN, SYS_EXIT]
+                .contains(&syscall_frame.syscall_number)
+            {
+                do_exit(TermStatus::Killed(SIGKILL), ctx, user_ctx);
+                return;
+            }
+        }
+        SeccompMode::Filter => {
+            match seccomp::execute_seccomp_filter(ctx.posix_thread, user_ctx, syscall_frame) {
+                Ok(SeccompFilterAction::KillProcess) => {
+                    do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    return;
+                }
+                Ok(SeccompFilterAction::KillThread) => {
+                    do_exit(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    return;
+                }
+                Ok(SeccompFilterAction::Trap(data)) => {
+                    const SYS_SECCOMP: i32 = 1;
+                    let mut info = siginfo_t::new(SIGSYS, SYS_SECCOMP);
+                    info.si_errno = data as i32;
+                    ctx.posix_thread
+                        .enqueue_signal(Box::new(RawSignal::new(info)));
+                    return;
+                }
+                Ok(SeccompFilterAction::Errno(code)) => {
+                    let ret = if code == 0 {
+                        0
+                    } else {
+                        (-(code as i64)) as usize
+                    };
+                    user_ctx.set_syscall_ret(ret);
+                    return;
+                }
+                Ok(SeccompFilterAction::UserNotif) => {
+                    error!("Seccomp UserNotif action is not supported yet");
+                    do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    return;
+                }
+                Ok(SeccompFilterAction::Trace(_)) => {
+                    error!("Seccomp TRACE action is not supported yet");
+                    do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    return;
+                }
+                Ok(SeccompFilterAction::Log) => {
+                    error!("Seccomp TRACE action is not supported yet");
+                    do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    return;
+                }
+                Ok(SeccompFilterAction::Allow) => (),
+                Err(_) => {
+                    error!("Seccomp filter return an invalid value");
+                    do_exit_group(TermStatus::Killed(SIGSYS), ctx, user_ctx);
+                    return;
+                }
+            }
+        }
+    }
+
     let syscall_return = arch::syscall_dispatch(
         syscall_frame.syscall_number,
         syscall_frame.args,
